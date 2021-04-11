@@ -27,7 +27,9 @@ Prerequisites
 
 OpenShift Config side 
 ```
-oc policy add-role-to-user edit system:serviceaccount:cicd:jenkins -n dev-namspace
+oc policy add-role-to-user edit system:serviceaccount:dha-devops:jenkins -n dev-covid-dev
+oc policy add-role-to-user edit system:serviceaccount:dha-devops:jenkins -n dev-covid-staging
+oc policy add-role-to-user edit system:serviceaccount:dha-devops:jenkins -n dev-covid-prod
 
 oc apply -f buildconfig_pipeline.yaml
 ```
