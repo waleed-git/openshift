@@ -1,0 +1,97 @@
+pipeline {
+        tools { 
+        maven 'Maven 3.6.3' 
+	    jdk 'jdk8'
+    }
+    agent any
+    environment {
+        DEV_PROJECT = "dev-namespace"
+        STAGE_PROJECT = "stage-namespace"
+		PROD_PROJECT =  "prod-namespace"
+        APP_NAME = "${project_name}"
+    }
+    stages {
+        stage ('Initialize') {
+            steps {
+                echo "test intialize"
+                    echo "PATH = ${PATH}"
+            }
+        }
+         stage('build && SonarQube analysis') {
+            when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'master'
+                   }
+               }
+            steps {
+                withSonarQubeEnv('sonarqube_server') {
+                        sh """
+                        mvn  $MAVEN_CLI_OPTS clean package sonar:sonar  
+                        """
+                }
+            }
+        } 
+
+
+        stage('Quality Gate'){
+            when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'master'
+                   }
+               }
+            steps {
+                script {
+                    sleep(60)
+                    timeout(time: 1, unit: 'MINUTES') { 
+                    def qg = waitForQualityGate() 
+                    if (qg.status != 'OK') {
+                          error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                        }
+                    }
+                }
+         }
+}
+        stage ('Build and Deploy master') {
+            when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'master'
+                   }
+               }
+            environment {
+					DEV_PROJECT = "dha-covid-dev"
+					STAGE_PROJECT = "dhacovidnonprod"
+					PROD_PROJECT =  "dhacovidprod"
+            }                  
+            steps {
+                timeout(time: 60, unit: 'MINUTES') {
+                    input message: "deploy to Production?"
+                }
+                sh """
+                   mvn clean install $MAVEN_CLI_OPTS
+		           mvn fabric8:build $MAVEN_CLI_OPTS -Dfabric8.namespace=$PROD_PROJECT
+                   mvn fabric8:resource  $MAVEN_CLI_OPTS -Dfabric8.namespace=$PROD_PROJECT
+                   mvn fabric8:deploy  $MAVEN_CLI_OPTS -Dfabric8.namespace=$PROD_PROJECT
+                  """
+            }
+        }
+
+        stage('Wait for deployment in PROD env') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject( "${PROD_PROJECT}" ) {
+                                  def deployment = openshift.selector("dc", "${APP_NAME}").rollout()
+                                   timeout(5) {
+                                         openshift.selector("dc", "${APP_NAME}").related('pods').untilEach(1) {
+                                                return (it.object().status.phase == "Running")
+                                         }
+                                    }
+                        }
+                    }
+                }
+            }
+        }
+
+} 
+
+}

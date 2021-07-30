@@ -1,0 +1,428 @@
+pipeline {
+    tools {
+        maven 'Maven 3.6.3'
+    }
+    agent any
+    environment {
+        DEV_PROJECT = "dev-namespace"
+        STAGE_PROJECT = "stage-namespace"
+		PROD_PROJECT = "prod-namespace"
+        APP_NAME = "${project_name}"
+    }
+    stages {
+          stage('Build App') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }
+    	        steps {
+        	          sh "mvn clean install $MAVEN_CLI_OPTS"
+               }
+          }
+          stage('build && SonarQube analysis') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }
+              steps {
+                withSonarQubeEnv('sonarqube_server') {
+                        sh """
+                        mvn  $MAVEN_CLI_OPTS clean package sonar:sonar  
+                        """
+                }
+            }
+        } 
+
+
+          stage('Quality Gate'){
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }
+              steps {
+                script {
+                    sleep(60)
+                    timeout(time: 1, unit: 'MINUTES') { 
+                    def qg = waitForQualityGate() 
+                    if (qg.status != 'OK') {
+                          error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                    }
+                    }
+                }
+              }
+          }
+
+
+          stage('Create Image Builder') {
+            when {
+              allOf {
+                     expression {
+                                return env.GIT_BRANCH =~ 'dev'
+                     }
+                     expression {
+                  openshift.withCluster() {
+                    openshift.withProject( "${DEV_PROJECT}" ) {
+            	         return !openshift.selector("bc", "${APP_NAME}").exists();
+                    }
+                  }
+                }
+             }
+            } 
+              steps {
+                  script {
+                    openshift.withCluster() {
+                     openshift.withProject( "${DEV_PROJECT}" ) {
+        	            openshift.newBuild("--name=${APP_NAME}", "--image-stream=redhat-openjdk18-openshift:1.8", "--binary")
+                     }
+                    }
+                 }
+              }
+          }
+          stage('Build app Image') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }
+              steps {
+                  script {
+                    openshift.withCluster() {
+                     openshift.withProject( "${DEV_PROJECT}" ) {
+	                    sh '''
+	                      rm -rf deployments && mkdir deployments
+                        cp target/*.jar ./deployments
+	                    '''
+       		            openshift.selector("bc", "${APP_NAME}").startBuild("--from-dir=./deployments","--follow", "--wait=true")
+                     }
+                   }
+                  }
+              }
+          }
+
+
+          stage('Create app on dev namespace') {
+            when {
+              allOf {
+                     expression {
+                                return env.GIT_BRANCH =~ 'dev'
+                     }
+                     expression {
+                    openshift.withCluster() {
+                     openshift.withProject( "${DEV_PROJECT}" ) {
+           		         return !openshift.selector('dc', '${APP_NAME}').exists()
+                     }
+                    }
+                   }
+              }
+            }  
+              steps {
+                script {
+                 openshift.withCluster() {
+                   openshift.withProject( "${DEV_PROJECT}" ) {
+        	          openshift.newApp("--as-deployment-config","${APP_NAME}:latest", "--name=${APP_NAME}", "-l app_type=java_app")
+               
+                   }
+                 }
+                }
+              }
+          }
+
+          stage('Inject CM/secret/environment to app on dev namespace') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }		  
+              steps {
+                script {
+                 openshift.withCluster() {
+                  openshift.withProject( "${DEV_PROJECT}" ) {
+                    openshift.apply("-f","openshift/${APP_NAME}-dc.yaml")
+                  }
+                 }
+                }
+              }
+         }
+
+          stage('Wait for S2I build to complete dev namespace') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }
+            steps {
+                script {
+                  openshift.withCluster() {
+                      openshift.withProject( "${DEV_PROJECT}" ) {
+                          def bc = openshift.selector("bc", "${APP_NAME}")
+                          def version = bc.object().status.lastVersion
+			                    def lastbuild_ver = openshift.selector("build", "${APP_NAME}"+"-"+version)
+			                    timeout(5) {
+                            lastbuild_ver.untilEach(1) {
+                                return (it.object().status.phase == "Complete")
+                                }
+		                       		}
+                            }
+                      }
+                }
+            }
+          }
+
+
+          stage('Wait for deployment in dev namespace') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject( "${DEV_PROJECT}" ) {
+                            def deployment = openshift.selector("dc", "${APP_NAME}").rollout()
+                              timeout(5) {
+                                openshift.selector("dc", "${APP_NAME}").related('pods').untilEach(1) {
+                                    return (it.object().status.phase == "Running")
+                                }
+                              }
+                            }
+                        }
+                    }
+               }
+            }
+/************************************************** START STAGING ***************************************/
+          stage('Build App on STAGING') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'staging'
+                    }
+              }
+    	        steps {
+        	          sh "mvn clean install $MAVEN_CLI_OPTS"
+               }
+          }
+         
+		  stage('Create Image Builder ON STAGING') {
+            when {
+              allOf {
+                     expression {
+                                return env.GIT_BRANCH =~ 'staging'
+                     }
+                     expression {
+                  openshift.withCluster() {
+                    openshift.withProject( "${STAGE_PROJECT}" ) {
+            	         return !openshift.selector("bc", "${APP_NAME}").exists();
+                    }
+                  }
+                }
+             }
+            } 
+              steps {
+                  script {
+                    openshift.withCluster() {
+                     openshift.withProject( "${STAGE_PROJECT}" ) {
+        	            openshift.newBuild("--name=${APP_NAME}", "--image-stream=redhat-openjdk18-openshift:1.8", "--binary")
+                     }
+                    }
+                 }
+              }
+          }
+		  
+          stage('Build app Image ON STAGEING') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'staging'
+                    }
+              }
+              steps {
+                  script {
+                    openshift.withCluster() {
+                     openshift.withProject( "${STAGE_PROJECT}" ) {
+	                    sh '''
+	                      rm -rf deployments && mkdir deployments
+                        cp target/*.jar ./deployments
+	                    '''
+       		            openshift.selector("bc", "${APP_NAME}").startBuild("--from-dir=./deployments","--follow", "--wait=true")
+                     }
+                   }
+                  }
+              }
+          }
+
+
+          stage('Create app on staging namespace ') {
+            when {
+              allOf {
+                     expression {
+                                return env.GIT_BRANCH =~ 'staging'
+                     }
+                     expression {
+                     openshift.withCluster() {
+                     openshift.withProject( "${STAGE_PROJECT}" ) {
+           		         return !openshift.selector('dc', '${APP_NAME}').exists()
+                     }
+                    }
+                   }
+              }
+            }  
+              steps {
+                script {
+                 openshift.withCluster() {
+                   openshift.withProject( "${STAGE_PROJECT}" ) {
+        	          openshift.newApp("--as-deployment-config","${APP_NAME}:latest", "--name=${APP_NAME}", "-l app_type=java_app")
+               
+                   }
+                 }
+                }
+              }
+          }
+          stage('Inject CM/secret/environment to ap on staging namespace ') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'staging'
+                    }
+              }		  
+              steps {
+                script {
+                 openshift.withCluster() {
+                  openshift.withProject( "${STAGE_PROJECT}" ) {
+                    openshift.apply("-f","openshift/${APP_NAME}-dc.yaml")
+                  }
+                 }
+                }
+              }
+         }         
+          stage('Wait for S2I build to complete staging namespace') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'staging'
+                    }
+              }
+            steps {
+                script {
+                  openshift.withCluster() {
+                      openshift.withProject( "${STAGE_PROJECT}" ) {
+                          def bc = openshift.selector("bc", "${APP_NAME}")
+                          def version = bc.object().status.lastVersion
+			                    def lastbuild_ver = openshift.selector("build", "${APP_NAME}"+"-"+version)
+			                    timeout(5) {
+                            lastbuild_ver.untilEach(1) {
+                                return (it.object().status.phase == "Complete")
+                                }
+		                       		}
+                            }
+                      }
+                }
+            }
+          }
+          stage('Wait for deployment in staging env') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'staging'
+                    }
+              }            
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject( "${STAGE_PROJECT}" ) {
+                            def deployment = openshift.selector("dc", "${APP_NAME}").rollout()
+                              timeout(5) {
+                                openshift.selector("dc", "${APP_NAME}").related('pods').untilEach(1) {
+                                    return (it.object().status.phase == "Running")
+                                }
+                              }
+                            }
+                        }
+                    }
+               }
+            }
+/************************************************** START PRODUCTION ***************************************/	
+	
+
+/*            
+ 
+          stage('tag image stream to production namespace') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'master'
+                    }
+              }
+              steps {
+                script {
+                  openshift.withCluster() {
+                    openshift.tag("${STAGE_PROJECT}/${APP_NAME}:latest", "${PROD_PROJECT}/${APP_NAME}:prod")
+                  }
+                }
+              }
+          }
+
+          stage('Launch app in Prod env') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'master'
+                    }
+              }
+              steps {
+                script {
+                  timeout(time: 60, unit: 'MINUTES') {
+                    input message: "deploy to Production?"
+                  }
+                  openshift.withCluster() {
+                      openshift.withProject("${PROD_PROJECT}") {
+                        if (openshift.selector("dc", "${APP_NAME}").exists()) {
+                              def deployment = openshift.selector("dc", "${APP_NAME}").rollout()
+                            }
+                          else {
+                              echo '### Creating a new app in PROD env ###'
+                          	  openshift.newApp("--as-deployment-config","${APP_NAME}:prod", "--name=${APP_NAME}", "-l app_type=java_app")
+                        }
+                      }
+                  }
+                }
+             }
+          }
+          stage('Inject CM/secret/environment to app on production namespace ') {
+			  when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'master'
+                    }
+              }
+              steps {
+                script {
+                 openshift.withCluster() {
+                  openshift.withProject( "${PROD_PROJECT}" ) {
+                    openshift.apply("-f","openshift/${APP_NAME}-dc.yaml")
+                  }
+                 }
+                }
+              }
+         }         
+
+          stage('Wait for deployment in production env') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'master'
+                    }
+              }            
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject( "${PROD_PROJECT}" ) {
+                            def deployment = openshift.selector("dc", "${APP_NAME}").rollout()
+                              timeout(5) {
+                                openshift.selector("dc", "${APP_NAME}").related('pods').untilEach(1) {
+                                    return (it.object().status.phase == "Running")
+                                }
+                              }
+                            }
+                        }
+                    }
+               }
+            }
+*/			
+          } 
+
+        }

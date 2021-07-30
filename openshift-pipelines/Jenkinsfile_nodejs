@@ -1,0 +1,342 @@
+pipeline {
+        tools {
+        nodejs 'nodejs'
+        }
+    agent any
+    environment {
+        DEV_PROJECT = "dev-namespace"
+        STAGE_PROJECT = "stage-namespace"
+        PROD_PROJECT = "prod-namespace"
+        APP_GIT_URL = "${uri}"
+        NEXUS_SERVER = "http://registry.npmjs.org/"
+        APP_NAME = "${project_name}"
+    }
+
+    stages {
+        stage('Run Unit Tests') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }		            
+            steps {
+                echo '### Running unit tests ###'
+              //  sh 'npm  run test'
+            }
+        }
+        stage('Run Linting Tools') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }	            
+            steps {
+                echo '### Running eslint on code ###'
+           //     sh 'npm run lint'
+            }
+        }
+
+        stage('SonarQube analysis') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }		            
+            steps {
+                script{
+                    def scannerHome = tool 'SonarScanner';
+                    withSonarQubeEnv('sonarqube_server') {
+                        sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=${APP_NAME}"
+                    }
+                }
+                
+            }
+        }
+
+        stage('Quality Gate'){
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }		            
+            steps {
+                script {
+                    sleep(60)
+                    timeout(time: 1, unit: 'MINUTES') { 
+                    def qg = waitForQualityGate() 
+                    if (qg.status != 'OK') {
+                          error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Launch new app in DEV env') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }		            
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${DEV_PROJECT}") {
+                            if (openshift.selector("bc", "${APP_NAME}").exists()) {
+                            openshift.selector("bc", "${APP_NAME}").startBuild("--follow","--wait=true")
+                            }
+                else {
+                        echo '### Creating a new app in DEV env ###'
+                        openshift.newApp("--as-deployment-config","nodejs:10~${APP_GIT_URL}#dev", "--name=${APP_NAME}", "-l app_type=nodejs_app")
+                        sleep 10
+                        openshift.selector("bc", "${APP_NAME}").logs("-f")
+                         }
+                       }
+                    }
+                }
+            }
+        }
+  stage('Inject CM/secret/environment to app on dev namespace') {     
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }		        
+      steps {                                                           
+        script {                                                        
+         openshift.withCluster() {                                      
+          openshift.withProject( "${DEV_PROJECT}" ) {                   
+            openshift.apply("-f","openshift/${APP_NAME}-dc.yaml")
+          }                                                             
+         }                                                              
+        }                                                               
+      }                                                                 
+ }                                                                              
+        stage('Wait for S2I build to complete') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }		            
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject( "${DEV_PROJECT}" ) {
+                            def bc = openshift.selector("bc", "${APP_NAME}")
+                            def version = bc.object().status.lastVersion
+                            def lastbuild_ver = openshift.selector("build", "${APP_NAME}"+"-"+version)
+                            timeout(5) {
+                            lastbuild_ver.untilEach(1) {
+                                return (it.object().status.phase == "Complete")
+                                }
+                                }
+                            }
+                        }
+                    }
+                 }
+            }
+
+
+        stage('Wait for deployment in DEV env') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'dev'
+                    }
+              }		            
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject( "${DEV_PROJECT}" ) {
+                                  def deployment = openshift.selector("dc", "${APP_NAME}").rollout()
+                                   timeout(5) {
+                                         openshift.selector("dc", "${APP_NAME}").related('pods').untilEach(1) {
+                                                return (it.object().status.phase == "Running")
+                                         }
+                                    }
+                        }
+                    }
+                }
+            }
+        }
+
+/************************************************** START STAGING ***************************************/
+
+        stage('Launch new app in STAGING env') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'staging'
+                    }
+              }		
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${STAGE_PROJECT}") {
+                            if (openshift.selector("bc", "${APP_NAME}").exists()) {
+                            openshift.selector("bc", "${APP_NAME}").startBuild("--follow","--wait=true")
+                            }
+                else {
+                        echo '### Creating a new app in STAGING env ###'
+                        openshift.newApp("--as-deployment-config","nodejs:10~${APP_GIT_URL}#staging", "--name=${APP_NAME}", "-l app_type=nodejs_app")
+                        sleep 10
+                        openshift.selector("bc", "${APP_NAME}").logs("-f")
+                         }
+                       }
+                    }
+                }
+            }
+        }
+		stage('Inject CM/secret/environment to app on staging namespace ') {
+		  when {
+				expression {
+				return env.GIT_BRANCH =~ 'staging'
+				}
+		  }		  
+		  steps {
+			script {
+			 openshift.withCluster() {
+			  openshift.withProject( "${STAGE_PROJECT}" ) {
+				openshift.apply("-f","openshift/${APP_NAME}-dc.yaml")
+			  }
+			 }
+			}
+		  }
+	 }         
+        stage('Wait for S2I build to complete Stage environment') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'staging'
+                    }
+              }		
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject( "${STAGE_PROJECT}" ) {
+                            def bc = openshift.selector("bc", "${APP_NAME}")
+                            def version = bc.object().status.lastVersion
+                            def lastbuild_ver = openshift.selector("build", "${APP_NAME}"+"-"+version)
+                            timeout(5) {
+                            lastbuild_ver.untilEach(1) {
+                                return (it.object().status.phase == "Complete")
+                                }
+                                }
+                            }
+                        }
+                    }
+                 }
+            }
+	  stage('Wait for deployment in staging env') {
+		  when {
+				expression {
+				return env.GIT_BRANCH =~ 'staging'
+				}
+		  }            
+		steps {
+			script {
+				openshift.withCluster() {
+					openshift.withProject( "${STAGE_PROJECT}" ) {
+						def deployment = openshift.selector("dc", "${APP_NAME}").rollout()
+						  timeout(5) {
+							openshift.selector("dc", "${APP_NAME}").related('pods').untilEach(1) {
+								return (it.object().status.phase == "Running")
+							}
+						  }
+						}
+					}
+				}
+		   }
+		}
+
+/************************************************** START PRODUCTION ***************************************/
+        stage('Launch new app in PRDO env') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'master'
+                    }
+              }		
+            steps {
+                script {
+                    timeout(time: 60, unit: 'MINUTES') {
+                        input message: "deploy to Production?"
+                    }
+                    openshift.withCluster() {
+                        openshift.withProject("${PROD_PROJECT}") {
+                            if (openshift.selector("bc", "${APP_NAME}").exists()) {
+                              openshift.selector("bc", "${APP_NAME}").startBuild("--follow","--wait=true")
+                            }
+                            else {
+                              echo '### Creating a new app in PRDO env ###'
+                              openshift.newApp("--as-deployment-config","nodejs:10~${APP_GIT_URL}#master", "--name=${APP_NAME}", "-l app_type=nodejs_app")
+                              sleep 10
+                              openshift.selector("bc", "${APP_NAME}").logs("-f")
+                            }
+                       }
+                    }
+                }
+            }
+        }
+		stage('Inject CM/secret/environment to app on prod namespace ') {
+		  when {
+				expression {
+				return env.GIT_BRANCH =~ 'master'
+				}
+		  }		  
+		  steps {
+			script {
+			 openshift.withCluster() {
+			  openshift.withProject( "${PROD_PROJECT}" ) {
+				openshift.apply("-f","openshift/${APP_NAME}-dc.yaml")
+			  }
+			 }
+			}
+		  }
+	 }         
+        stage('Wait for S2I build to complete Prod environment') {
+              when {
+                    expression {
+                    return env.GIT_BRANCH =~ 'master'
+                    }
+              }		
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject( "${PROD_PROJECT}" ) {
+                            def bc = openshift.selector("bc", "${APP_NAME}")
+                            def version = bc.object().status.lastVersion
+                            def lastbuild_ver = openshift.selector("build", "${APP_NAME}"+"-"+version)
+                            timeout(5) {
+                            lastbuild_ver.untilEach(1) {
+                                return (it.object().status.phase == "Complete")
+                                }
+                                }
+                            }
+                        }
+                    }
+                 }
+            }
+	  stage('Wait for deployment in prod env') {
+		  when {
+				expression {
+				return env.GIT_BRANCH =~ 'master'
+				}
+		  }            
+		steps {
+			script {
+				openshift.withCluster() {
+					openshift.withProject( "${PROD_PROJECT}" ) {
+						def deployment = openshift.selector("dc", "${APP_NAME}").rollout()
+						  timeout(5) {
+							openshift.selector("dc", "${APP_NAME}").related('pods').untilEach(1) {
+								return (it.object().status.phase == "Running")
+							}
+						  }
+						}
+					}
+				}
+		   }
+		}
+
+
+
+}
+
+}

@@ -1,0 +1,25 @@
+kind: BuildConfig
+apiVersion: v1
+metadata:
+  name: ${project_name}-pipeline
+  labels:
+    app: ${project_name}-pipeline
+spec:
+  source:
+    git:
+      ref: "dev"
+      uri: "${uri}"
+    type: Git
+    sourceSecret:
+        name: "repo-at-github"
+  triggers:
+        - type: "GitLab"
+          gitlab:
+                secret: "webhooksecret"    
+  strategy:
+    type: JenkinsPipeline
+    jenkinsPipelineStrategy:
+      jenkinsfilePath: Jenkinsfile 
+       
+      
+ 
